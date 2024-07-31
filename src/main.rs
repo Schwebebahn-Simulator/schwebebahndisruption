@@ -170,7 +170,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(Arc::clone(&state)))
             .route("/status", web::get().to(status))
     })
-    .bind("127.0.0.1:8080")?
+    .bind("0.0.0.0:8070")?
     .run()
     .await
 }
