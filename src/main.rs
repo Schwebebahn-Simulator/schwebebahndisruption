@@ -149,7 +149,6 @@ async fn main() -> std::io::Result<()> {
         let client = Client::new();
 
         loop {
-            interval.tick().await;
             if should_check(&state_clone) {
                 match scrape_status(&client).await {
                     Ok((schwebebahn, elevators)) => {
@@ -162,6 +161,7 @@ async fn main() -> std::io::Result<()> {
                     Err(e) => eprintln!("Error scraping status: {}", e),
                 }
             }
+            interval.tick().await;
         }
     });
 
