@@ -1,10 +1,8 @@
-use actix_web::{web, App, HttpResponse, HttpServer};
+use worker::*;
 use chrono::{DateTime, Duration, Utc};
 use reqwest::Client;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
-use tokio::time::interval;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 struct ElevatorStatus {
@@ -22,11 +20,6 @@ struct Status {
     elevators: Vec<ElevatorStatus>,
     #[serde(with = "chrono::serde::ts_seconds_option")]
     last_updated: Option<DateTime<Utc>>,
-}
-
-struct AppState {
-    last_api_request: Mutex<Option<DateTime<Utc>>>,
-    status: Mutex<Status>,
 }
 
 async fn scrape_status(client: &Client) -> Result<(Vec<String>, Vec<ElevatorStatus>), Box<dyn std::error::Error>> {
@@ -107,7 +100,7 @@ fn parse_elevator_status(row: &scraper::element_ref::ElementRef, document: &Html
 }
 
 fn parse_schwebebahn_status(row: &scraper::element_ref::ElementRef) -> String {
-    format!("{}: {}", 
+   format!("{}: {}", 
         row.select(&Selector::parse("td.cell-event span.flag").unwrap()).next()
             .and_then(|el| el.text().next())
             .unwrap_or("").trim(),
@@ -124,61 +117,40 @@ fn parse_period(period: &str) -> (String, String) {
     (start.to_string(), end.to_string())
 }
 
-async fn status(data: web::Data<Arc<AppState>>) -> HttpResponse {
-    let mut last_request = data.last_api_request.lock().unwrap();
-    *last_request = Some(Utc::now());
-    
-    let status = data.status.lock().unwrap().clone();
-    HttpResponse::Ok().json(status)
-}
+#[event(fetch)]
+async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    let router = Router::new();
 
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    let state = Arc::new(AppState {
-        last_api_request: Mutex::new(None),
-        status: Mutex::new(Status {
-            schwebebahn: Vec::new(),
-            elevators: Vec::new(),
-            last_updated: None,
-        }),
-    });
+    router
+        .get("/status", |_, ctx| async move {
+            let kv = ctx.kv("STATUS_STORE")?;
+            let status: Option<Status> = kv.get("current_status").json().await?;
 
-    let state_clone = Arc::clone(&state);
-    tokio::spawn(async move {
-        let mut interval = interval(Duration::minutes(15).to_std().unwrap());
-        let client = Client::new();
-
-        loop {
-            if should_check(&state_clone) {
-                match scrape_status(&client).await {
-                    Ok((schwebebahn, elevators)) => {
-                        let mut app_status = state_clone.status.lock().unwrap();
-                        app_status.schwebebahn = schwebebahn;
-                        app_status.elevators = elevators;
-                        app_status.last_updated = Some(Utc::now());
-                        println!("Status updated: {:?}", app_status);
-                    },
-                    Err(e) => eprintln!("Error scraping status: {}", e),
-                }
+            match status {
+                Some(s) => Response::from_json(&s),
+                None => Response::error("No status available", 404),
             }
-            interval.tick().await;
-        }
-    });
-
-    HttpServer::new(move || {
-        App::new()
-            .app_data(web::Data::new(Arc::clone(&state)))
-            .route("/status", web::get().to(status))
-    })
-    .bind("0.0.0.0:8070")?
-    .run()
-    .await
+        })
+        .run(req, env)
+        .await
 }
 
-fn should_check(state: &Arc<AppState>) -> bool {
-    let last_request = state.last_api_request.lock().unwrap();
-    match *last_request {
-        Some(time) => Utc::now() - time < Duration::minutes(20),
-        None => false,
+#[event(scheduled)]
+pub async fn cron(event: ScheduledEvent, env: Env, _ctx: Context) {
+    let client = Client::new();
+    match scrape_status(&client).await {
+        Ok((schwebebahn, elevators)) => {
+            let status = Status {
+                schwebebahn,
+                elevators,
+                last_updated: Some(Utc::now()),
+            };
+
+            let kv = env.kv("STATUS_STORE").unwrap();
+            if let Err(e) = kv.put("current_status", serde_json::to_string(&status).unwrap()).await {
+                console_log!("Error saving status to KV: {:?}", e);
+            }
+        },
+        Err(e) => console_log!("Error scraping status: {}", e),
     }
 }
